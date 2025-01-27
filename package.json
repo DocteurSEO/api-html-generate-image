@@ -1,0 +1,13 @@
+{
+  "dependencies": {
+    "bull": "^4.16.5",
+    "cluster": "^0.7.7",
+    "compression": "^1.7.5",
+    "crypto": "^1.0.1",
+    "express": "^4.21.2",
+    "fs": "^0.0.1-security",
+    "lru-cache": "^6.0.0",
+    "os": "^0.1.2",
+    "puppeteer": "^24.1.1"
+  }
+}
