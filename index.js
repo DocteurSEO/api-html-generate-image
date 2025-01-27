@@ -1,248 +1,332 @@
 const express = require("express");
 const puppeteer = require("puppeteer");
 const Queue = require("bull");
-const crypto = require("crypto");
-const fs = require("fs");
 const cluster = require("cluster");
 const os = require("os");
-const LRU = require('lru-cache');
+const crypto = require("crypto");
+const sharp = require("sharp");
+const LRU = require("lru-cache");
+const fs = require("fs").promises;
+const path = require("path");
+const compression = require("compression");
 
-// Configuration
+// Configuration avancée
 const CONFIG = {
   PORT: process.env.PORT || 3001,
   WORKERS: process.env.WORKERS || os.cpus().length,
   CACHE_DIR: "./cache",
-  MAX_MEMORY_CACHE: 100, // Nombre maximum d'images en mémoire
-  CLEANUP_INTERVAL: 3600000, // Nettoyage du cache toutes les heures
-  PAGE_TIMEOUT: 30000, // Timeout de 30s pour le rendu
+  MAX_MEMORY_CACHE: 200,  // Augmenté pour de meilleures performances
+  CLEANUP_INTERVAL: 3600000,
+  PAGE_TIMEOUT: 15000,
+  MAX_CONCURRENT_JOBS: 5,
+  MEMORY_LIMIT: 512 * 1024 * 1024, // 512MB par worker
+  BROWSER_CONFIG: {
+    headless: "new",
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--disable-extensions',
+      '--disable-audio-output',
+      '--js-flags=--max-old-space-size=512',
+      '--single-process',
+      '--disable-web-security',
+      '--enable-low-end-device-mode'
+    ]
+  }
 };
 
-// Cache en mémoire avec LRU
+// Cache optimisé
 const memoryCache = new LRU({
   max: CONFIG.MAX_MEMORY_CACHE,
-  ttl: 1000 * 60 * 60 // 1 heure
+  ttl: 1000 * 60 * 60,
+  updateAgeOnGet: true,
+  updateAgeOnHas: true
 });
 
 if (cluster.isMaster) {
-  // Configuration du dossier cache
-  if (!fs.existsSync(CONFIG.CACHE_DIR)) {
-    fs.mkdirSync(CONFIG.CACHE_DIR);
-  }
+  console.log(`Master process ${process.pid} starting...`);
+
+  // Création du dossier cache
+  fs.mkdir(CONFIG.CACHE_DIR, { recursive: true }).catch(console.error);
 
   // Lancement des workers
   for (let i = 0; i < CONFIG.WORKERS; i++) {
     cluster.fork();
   }
 
-  // Redémarrage des workers en cas de crash
+  // Gestion des workers
   cluster.on('exit', (worker, code, signal) => {
-    console.log(`Worker ${worker.id} died. Restarting...`);
+    console.log(`Worker ${worker.id} died (${signal || code}). Restarting...`);
     cluster.fork();
   });
 
-  // Nettoyage périodique du cache
-  setInterval(() => {
-    const now = Date.now();
-    fs.readdir(CONFIG.CACHE_DIR, (err, files) => {
-      if (err) return;
-      files.forEach(file => {
-        const filePath = `${CONFIG.CACHE_DIR}/${file}`;
-        fs.stat(filePath, (err, stats) => {
-          if (err) return;
-          if (now - stats.mtime.getTime() > 24 * 3600000) { // Supprimer les fichiers plus vieux que 24h
-            fs.unlink(filePath, () => {});
-          }
-        });
-      });
-    });
-  }, CONFIG.CLEANUP_INTERVAL);
-
-} else {
-  // Code du worker
-  let browser;
-  
-  // Add error handling for browser initialization
-  async function initBrowser() {
+  // Nettoyage intelligent du cache
+  async function cleanupCache() {
     try {
-      browser = await puppeteer.launch({
-        headless: "new",
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-extensions',
-          '--disable-audio-output',
-        ],
-      });
-    } catch (error) {
-      console.error('Failed to launch browser:', error);
-      process.exit(1);
+      const files = await fs.readdir(CONFIG.CACHE_DIR);
+      const now = Date.now();
+      
+      for (const file of files) {
+        const filePath = path.join(CONFIG.CACHE_DIR, file);
+        const stats = await fs.stat(filePath);
+        
+        if (now - stats.mtime.getTime() > 24 * 3600000) {
+          await fs.unlink(filePath).catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error('Cache cleanup error:', err);
     }
   }
 
-  // Pool de pages précréées
-  const pagePool = {
-    pages: [],
-    async init(size = 5) {
-      for (let i = 0; i < size; i++) {
-        const page = await browser.newPage();
-        await page.setCacheEnabled(true);
-        this.pages.push({ page, inUse: false });
+  setInterval(cleanupCache, CONFIG.CLEANUP_INTERVAL);
+
+} else {
+  let browser;
+  let pagePool;
+
+  // Gestionnaire de pages optimisé
+  class PagePool {
+    constructor() {
+      this.pages = [];
+      this.maxSize = 5;
+    }
+
+    async initialize(browser) {
+      for (let i = 0; i < this.maxSize; i++) {
+        const page = await this.createOptimizedPage(browser);
+        this.pages.push({ page, inUse: false, lastUsed: Date.now() });
       }
-    },
-    async acquire() {
-      const available = this.pages.find(p => !p.inUse);
-      if (available) {
-        available.inUse = true;
-        return available.page;
-      }
+    }
+
+    async createOptimizedPage(browser) {
       const page = await browser.newPage();
+      
+      // Optimisations agressives
+      await page.setJavaScriptEnabled(false);
       await page.setCacheEnabled(true);
-      this.pages.push({ page, inUse: true });
+      await page.setRequestInterception(true);
+      
+      page.on('request', request => {
+        const type = request.resourceType();
+        if (['image', 'stylesheet', 'font', 'script', 'media'].includes(type)) {
+          request.abort();
+        } else {
+          request.continue();
+        }
+      });
+
       return page;
-    },
-    release(page) {
+    }
+
+    async acquire() {
+      const availablePage = this.pages.find(p => !p.inUse);
+      if (availablePage) {
+        availablePage.inUse = true;
+        availablePage.lastUsed = Date.now();
+        return availablePage.page;
+      }
+
+      // Créer une nouvelle page si nécessaire
+      const page = await this.createOptimizedPage(browser);
+      this.pages.push({ page, inUse: true, lastUsed: Date.now() });
+      return page;
+    }
+
+    async release(page) {
       const pageInfo = this.pages.find(p => p.page === page);
       if (pageInfo) {
+        await page.goto('about:blank');
+        await page.setJavaScriptEnabled(false);
         pageInfo.inUse = false;
       }
     }
-  };
 
+    async cleanup() {
+      const now = Date.now();
+      for (const pageInfo of this.pages) {
+        if (!pageInfo.inUse && (now - pageInfo.lastUsed > 300000)) {
+          await pageInfo.page.close();
+          this.pages = this.pages.filter(p => p !== pageInfo);
+        }
+      }
+    }
+  }
+
+  // File d'attente optimisée
   const queue = new Queue("image-generation", {
     limiter: {
-      max: 5, // Nombre maximum de jobs simultanés
+      max: CONFIG.MAX_CONCURRENT_JOBS,
       duration: 1000
+    },
+    defaultJobOptions: {
+      removeOnComplete: true,
+      removeOnFail: true,
+      timeout: CONFIG.PAGE_TIMEOUT
     }
   });
 
+  // Fonction de génération d'image optimisée
   async function generateImage(html, options = {}) {
-    const hash = crypto.createHash("md5").update(html + JSON.stringify(options)).digest("hex");
-    const cachedFile = `${CONFIG.CACHE_DIR}/${hash}.png`;
+    const hash = crypto.createHash("md5")
+      .update(html + JSON.stringify(options))
+      .digest("hex");
+    
+    const cachedFile = path.join(CONFIG.CACHE_DIR, `${hash}.webp`);
 
     // Vérifier le cache mémoire
     const cachedImage = memoryCache.get(hash);
-    if (cachedImage) return cachedImage;
-
-    // Vérifier le cache fichier
-    if (fs.existsSync(cachedFile)) {
-      const image = fs.readFileSync(cachedFile);
-      memoryCache.set(hash, image);
-      return image;
+    if (cachedImage) {
+      return { image: cachedImage, cached: true };
     }
 
+    // Vérifier le cache fichier
+    try {
+      const fileExists = await fs.access(cachedFile)
+        .then(() => true)
+        .catch(() => false);
+      
+      if (fileExists) {
+        const image = await fs.readFile(cachedFile);
+        memoryCache.set(hash, image);
+        return { image, cached: true };
+      }
+    } catch (err) {
+      console.error('Cache access error:', err);
+    }
+
+    // Générer nouvelle image
     const page = await pagePool.acquire();
     try {
       const { width = 1280, height = 720, fullPage = true } = options;
 
-      await page.setViewport({ width, height });
-      await Promise.race([
-        page.setContent(html, { waitUntil: "networkidle0" }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), CONFIG.PAGE_TIMEOUT))
-      ]);
-
-      const screenshot = await page.screenshot({ 
-        type: "png", 
-        fullPage,
-        optimizeForSpeed: true
+      await page.setViewport({ 
+        width, 
+        height, 
+        deviceScaleFactor: 1 
       });
 
-      // Sauvegarder dans les caches
-      fs.writeFileSync(cachedFile, screenshot);
-      memoryCache.set(hash, screenshot);
+      await Promise.race([
+        page.setContent(html, { 
+          waitUntil: "domcontentloaded",
+          timeout: CONFIG.PAGE_TIMEOUT
+        }),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Rendering timeout')), CONFIG.PAGE_TIMEOUT)
+        )
+      ]);
 
-      return screenshot;
+      const screenshot = await page.screenshot({
+        fullPage,
+        type: 'jpeg',
+        quality: 90
+      });
+
+      // Optimiser l'image avec Sharp
+      const optimizedImage = await sharp(screenshot)
+        .webp({
+          quality: 80,
+          effort: 4,
+          lossless: false
+        })
+        .toBuffer();
+
+      // Sauvegarder dans les caches
+      await fs.writeFile(cachedFile, optimizedImage);
+      memoryCache.set(hash, optimizedImage);
+
+      return { image: optimizedImage, cached: false };
     } finally {
-      pagePool.release(page);
+      await pagePool.release(page);
     }
   }
 
-  queue.process(async (job, done) => {
+  // Traitement des jobs
+  queue.process(async (job) => {
     const { html, options } = job.data;
+    const result = await generateImage(html, options);
+    return result.image;
+  });
+
+  // Configuration Express
+  const app = express();
+  app.use(compression());
+  app.use(express.json({ limit: "2mb" }));
+
+  // Routes
+  app.post("/image", async (req, res) => {
+    const { html, options = {} } = req.body;
+
+    if (!html) {
+      return res.status(400).json({ error: "HTML content is required" });
+    }
+
     try {
-      const image = await generateImage(html, options);
-      done(null, image);
+      const job = await queue.add({ html, options });
+      const result = await job.finished();
+
+      res.set({
+        'Content-Type': 'image/webp',
+        'Cache-Control': 'public, max-age=3600',
+        'X-Generated-By': `Worker-${cluster.worker.id}`
+      });
+      
+      res.end(Buffer.from(result));
     } catch (err) {
-      done(err);
+      console.error("Generation error:", err);
+      res.status(500).json({ 
+        error: "Image generation failed",
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+      });
     }
   });
 
-  const app = express();
-  app.use(express.json({ limit: "1mb" }));
-  app.use(require('compression')());
-
-  // Add GET route for images
-  app.get("/image", async (req, res) => {
-    const html = decodeURIComponent(req.query.html);
-    const options = req.query.options ? JSON.parse(decodeURIComponent(req.query.options)) : {};
-
-    if (!html) {
-        return res.status(400).json({ error: "HTML content is required" });
-    }
-
-    try {
-        const job = await queue.add({ html, options }, {
-            removeOnComplete: true,
-            removeOnFail: true
-        });
-
-        const result = await job.finished();
-        
-        res.writeHead(200, {
-            'Content-Type': 'image/png',
-            'Content-Disposition': 'inline; filename=screenshot.png'
-        });
-        res.end(Buffer.from(result));
-    } catch (err) {
-        console.error("Error generating image:", err);
-        res.status(500).json({ error: err.message || "Internal Server Error" });
-    }
-});
-
-app.post("/image", async (req, res) => {
-    const { html, options } = req.body;
-
-    if (!html) {
-        return res.status(400).json({ error: "HTML content is required" });
-    }
-
-    try {
-        const job = await queue.add({ html, options: options || {} }, {
-            removeOnComplete: true,
-            removeOnFail: true
-        });
-
-        const result = await job.finished();
-
-        res.writeHead(200, {
-            'Content-Type': 'image/png',
-            'Content-Disposition': 'inline; filename=screenshot.png'
-        });
-        res.end(Buffer.from(result));
-    } catch (err) {
-        console.error("Error generating image:", err);
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
-  app.use((req, res) => {
-    res.status(404).json({ error: "Route not found" });
+  // Gestion d'erreurs
+  app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   });
 
   // Initialisation
-  (async () => {
-    await initBrowser();
-    await pagePool.init();
-    app.listen(CONFIG.PORT, () => {
-      console.log(`Worker ${cluster.worker.id} running on http://localhost:${CONFIG.PORT}`);
-    });
-  })();
-  // Add graceful shutdown
-  process.on('SIGTERM', async () => {
-    if (browser) {
-      await browser.close();
+  async function initialize() {
+    try {
+      browser = await puppeteer.launch(CONFIG.BROWSER_CONFIG);
+      pagePool = new PagePool();
+      await pagePool.initialize(browser);
+      
+      app.listen(CONFIG.PORT, () => {
+        console.log(`Worker ${cluster.worker.id} running on port ${CONFIG.PORT}`);
+      });
+
+      // Nettoyage périodique des pages
+      setInterval(() => pagePool.cleanup(), 300000);
+
+      // Monitoring mémoire
+      setInterval(() => {
+        const used = process.memoryUsage().heapUsed;
+        if (used > CONFIG.MEMORY_LIMIT) {
+          pagePool.cleanup();
+        }
+      }, 60000);
+
+    } catch (err) {
+      console.error('Initialization failed:', err);
+      process.exit(1);
     }
+  }
+
+  // Gestion de l'arrêt
+  async function shutdown() {
+    if (browser) await browser.close();
+    await queue.close();
     process.exit(0);
-  });
+  }
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  initialize();
 }
