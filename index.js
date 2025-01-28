@@ -89,75 +89,12 @@ if (cluster.isMaster) {
   let browser;
   let pagePool;
 
-  // Gestionnaire de pages optimisé
-  class PagePool {
-    constructor() {
-      this.pages = [];
-      this.maxSize = 5;
-    }
+  // Configuration Express
+  const app = express();
+  app.use(compression());
+  app.use(express.json({ limit: "2mb" }));
 
-    async initialize(browser) {
-      for (let i = 0; i < this.maxSize; i++) {
-        const page = await this.createOptimizedPage(browser);
-        this.pages.push({ page, inUse: false, lastUsed: Date.now() });
-      }
-    }
-
-    async createOptimizedPage(browser) {
-      const page = await browser.newPage();
-      
-      // Optimisations agressives
-      await page.setJavaScriptEnabled(false);
-      await page.setCacheEnabled(true);
-      await page.setRequestInterception(true);
-      
-      page.on('request', request => {
-        const type = request.resourceType();
-        if (['image', 'stylesheet', 'font', 'script', 'media'].includes(type)) {
-          request.abort();
-        } else {
-          request.continue();
-        }
-      });
-
-      return page;
-    }
-
-    async acquire() {
-      const availablePage = this.pages.find(p => !p.inUse);
-      if (availablePage) {
-        availablePage.inUse = true;
-        availablePage.lastUsed = Date.now();
-        return availablePage.page;
-      }
-
-      // Créer une nouvelle page si nécessaire
-      const page = await this.createOptimizedPage(browser);
-      this.pages.push({ page, inUse: true, lastUsed: Date.now() });
-      return page;
-    }
-
-    async release(page) {
-      const pageInfo = this.pages.find(p => p.page === page);
-      if (pageInfo) {
-        await page.goto('about:blank');
-        await page.setJavaScriptEnabled(false);
-        pageInfo.inUse = false;
-      }
-    }
-
-    async cleanup() {
-      const now = Date.now();
-      for (const pageInfo of this.pages) {
-        if (!pageInfo.inUse && (now - pageInfo.lastUsed > 300000)) {
-          await pageInfo.page.close();
-          this.pages = this.pages.filter(p => p !== pageInfo);
-        }
-      }
-    }
-  }
-
-  // File d'attente optimisée
+  // Queue configuration and error handling
   const queue = new Queue("image-generation", {
     limiter: {
       max: CONFIG.MAX_CONCURRENT_JOBS,
@@ -170,8 +107,6 @@ if (cluster.isMaster) {
     }
   });
 
-  // Fonction de génération d'image optimisée
-  // Add Redis connection error handling
   queue.on('error', (error) => {
     console.error('Queue error:', error);
   });
@@ -180,7 +115,7 @@ if (cluster.isMaster) {
     console.error('Job failed:', error);
   });
 
-  // Modify the generateImage function
+  // Generate Image function definition
   async function generateImage(html, options = {}) {
     console.log('Starting image generation...');
     try {
@@ -221,7 +156,7 @@ if (cluster.isMaster) {
     }
   }
 
-  // Modify the route handler
+  // Route definitions
   app.get("/image", async (req, res) => {
     console.log('GET request received at:', new Date().toISOString());
     
