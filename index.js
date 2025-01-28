@@ -89,7 +89,7 @@ if (cluster.isMaster) {
   let browser;
   let pagePool;
 
-  // Configuration Express
+  // Configuration Express (keep only this one)
   const app = express();
   app.use(compression());
   app.use(express.json({ limit: "2mb" }));
@@ -189,10 +189,10 @@ if (cluster.isMaster) {
     return result.image;
   });
 
-  // Configuration Express
-  const app = express();
-  app.use(compression());
-  app.use(express.json({ limit: "2mb" }));
+  // Remove this duplicate Express configuration
+  // const app = express();
+  // app.use(compression());
+  // app.use(express.json({ limit: "2mb" }));
 
   // Routes
   app.post("/image", async (req, res) => {
