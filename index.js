@@ -8,6 +8,7 @@ const LRU = require("lru-cache");
 const fs = require("fs").promises;
 const path = require("path");
 const compression = require("compression");
+const cors = require("cors");  // Add this line
 
 // Configuration
 const CONFIG = {
@@ -161,6 +162,7 @@ if (cluster.isMaster) {
   let pagePool;
   
   const app = express();
+  app.use(cors());  // Add this line
   app.use(compression());
   app.use(express.json({ limit: "2mb" }));
   
