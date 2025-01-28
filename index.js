@@ -18,6 +18,7 @@ const CONFIG = {
   MAX_MEMORY_CACHE: 200,  // Augmenté pour de meilleures performances
   CLEANUP_INTERVAL: 3600000,
   PAGE_TIMEOUT: 15000,
+  REQUEST_TIMEOUT: 30000,  // Add request timeout
   MAX_CONCURRENT_JOBS: 5,
   MEMORY_LIMIT: 512 * 1024 * 1024, // 512MB par worker
   BROWSER_CONFIG: {
