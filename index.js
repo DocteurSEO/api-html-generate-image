@@ -258,30 +258,50 @@ if (cluster.isMaster) {
 
   // Routes
   app.post("/image", async (req, res) => {
-    const { html, options = {} } = req.body;
+    console.log('Received POST request:', req.body);
+    const { html, options } = req.body;
 
     if (!html) {
-      return res.status(400).json({ error: "HTML content is required" });
+        console.log('No HTML content provided');
+        return res.status(400).json({ error: "HTML content is required" });
     }
 
     try {
-      const job = await queue.add({ html, options });
-      const result = await job.finished();
+        console.log('Adding job to queue...');
+        const job = await queue.add({ html, options: options || {} }, {
+            removeOnComplete: true,
+            removeOnFail: true
+        });
 
-      res.set({
-        'Content-Type': 'image/webp',
-        'Cache-Control': 'public, max-age=3600',
-        'X-Generated-By': `Worker-${cluster.worker.id}`
-      });
-      
-      res.end(Buffer.from(result));
+        console.log('Waiting for job to complete...');
+        const result = await job.finished();
+        console.log('Job completed, sending response...');
+
+        res.writeHead(200, {
+            'Content-Type': 'image/png',
+            'Content-Disposition': 'inline; filename=screenshot.png'
+        });
+        res.end(Buffer.from(result));
     } catch (err) {
-      console.error("Generation error:", err);
-      res.status(500).json({ 
-        error: "Image generation failed",
-        details: process.env.NODE_ENV === 'development' ? err.message : undefined
-      });
+        console.error("Error generating image:", err);
+        res.status(500).json({ error: err.message || "Internal Server Error" });
     }
+});
+
+  res.set({
+    'Content-Type': 'image/webp',
+    'Cache-Control': 'public, max-age=3600',
+    'X-Generated-By': `Worker-${cluster.worker.id}`
+  });
+  
+  res.end(Buffer.from(result));
+} catch (err) {
+  console.error("Generation error:", err);
+  res.status(500).json({ 
+    error: "Image generation failed",
+    details: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
+}
   });
 
   // Gestion d'erreurs
