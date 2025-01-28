@@ -93,7 +93,24 @@ app.get("/image", async (req, res) => {
       return res.status(400).json({ error: "HTML required" });
     }
 
-    const result = await generateImage(decodeURIComponent(req.query.html));
+    // Extract and validate image options from query parameters
+    const options = {
+      width: parseInt(req.query.width) || 800,
+      height: parseInt(req.query.height) || 600,
+      quality: parseInt(req.query.quality) || 80
+    };
+
+    // Validate dimensions
+    if (options.width < 1 || options.width > 4000 || options.height < 1 || options.height > 4000) {
+      return res.status(400).json({ error: "Invalid dimensions. Width and height must be between 1 and 4000 pixels" });
+    }
+
+    // Validate quality
+    if (options.quality < 1 || options.quality > 100) {
+      return res.status(400).json({ error: "Invalid quality. Must be between 1 and 100" });
+    }
+
+    const result = await generateImage(decodeURIComponent(req.query.html), options);
     
     res.set({
       'Content-Type': 'image/jpeg',
