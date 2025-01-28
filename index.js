@@ -129,12 +129,45 @@ app.use((err, req, res, next) => {
 });
 
 // Initialisation et gestion de l'arrêt
+// Add these handlers at the top level
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  shutdown();
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  shutdown();
+});
+
+// Modify the shutdown function
+async function shutdown() {
+  console.log('Shutting down gracefully...');
+  try {
+    if (browser) await browser.close();
+    server.close(() => {
+      console.log('Server closed');
+      process.exit(0);
+    });
+    
+    // Force exit if graceful shutdown fails
+    setTimeout(() => {
+      console.error('Could not close connections in time, forcefully shutting down');
+      process.exit(1);
+    }, 10000);
+  } catch (error) {
+    console.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+}
+
+// Modify the initialize function to store the server instance
 async function initialize() {
   try {
     browser = await puppeteer.launch(CONFIG.BROWSER_CONFIG);
     await initializePage();
 
-    app.listen(CONFIG.PORT, () => {
+    const server = app.listen(CONFIG.PORT, () => {
       console.log(`Server running on port ${CONFIG.PORT}`);
     });
 
@@ -151,11 +184,6 @@ async function initialize() {
     console.error('Initialization failed:', error);
     process.exit(1);
   }
-}
-
-async function shutdown() {
-  if (browser) await browser.close();
-  process.exit(0);
 }
 
 process.on('SIGTERM', shutdown);
