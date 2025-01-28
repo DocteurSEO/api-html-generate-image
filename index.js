@@ -171,79 +171,81 @@ if (cluster.isMaster) {
   });
 
   // Fonction de génération d'image optimisée
+  // Add Redis connection error handling
+  queue.on('error', (error) => {
+    console.error('Queue error:', error);
+  });
+
+  queue.on('failed', (job, error) => {
+    console.error('Job failed:', error);
+  });
+
+  // Modify the generateImage function
   async function generateImage(html, options = {}) {
-    const hash = crypto.createHash("md5")
-      .update(html + JSON.stringify(options))
-      .digest("hex");
-    
-    const cachedFile = path.join(CONFIG.CACHE_DIR, `${hash}.webp`);
-
-    // Vérifier le cache mémoire
-    const cachedImage = memoryCache.get(hash);
-    if (cachedImage) {
-      return { image: cachedImage, cached: true };
-    }
-
-    // Vérifier le cache fichier
+    console.log('Starting image generation...');
     try {
-      const fileExists = await fs.access(cachedFile)
-        .then(() => true)
-        .catch(() => false);
+      const hash = crypto.createHash("md5")
+        .update(html + JSON.stringify(options))
+        .digest("hex");
       
-      if (fileExists) {
-        const image = await fs.readFile(cachedFile);
-        memoryCache.set(hash, image);
-        return { image, cached: true };
+      console.log('Generated hash:', hash);
+      
+      const page = await pagePool.acquire();
+      console.log('Acquired page from pool');
+  
+      try {
+        const { width = 1280, height = 720, fullPage = true } = options;
+        console.log('Setting viewport:', { width, height });
+  
+        await page.setViewport({ width, height, deviceScaleFactor: 1 });
+        console.log('Viewport set, setting content...');
+  
+        await page.setContent(html, { waitUntil: "domcontentloaded" });
+        console.log('Content set, taking screenshot...');
+  
+        const screenshot = await page.screenshot({
+          fullPage,
+          type: 'jpeg',
+          quality: 90
+        });
+        console.log('Screenshot taken');
+  
+        return screenshot;
+      } finally {
+        await pagePool.release(page);
+        console.log('Page released back to pool');
       }
-    } catch (err) {
-      console.error('Cache access error:', err);
-    }
-
-    // Générer nouvelle image
-    const page = await pagePool.acquire();
-    try {
-      const { width = 1280, height = 720, fullPage = true } = options;
-
-      await page.setViewport({ 
-        width, 
-        height, 
-        deviceScaleFactor: 1 
-      });
-
-      await Promise.race([
-        page.setContent(html, { 
-          waitUntil: "domcontentloaded",
-          timeout: CONFIG.PAGE_TIMEOUT
-        }),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Rendering timeout')), CONFIG.PAGE_TIMEOUT)
-        )
-      ]);
-
-      const screenshot = await page.screenshot({
-        fullPage,
-        type: 'jpeg',
-        quality: 90
-      });
-
-      // Optimiser l'image avec Sharp
-      const optimizedImage = await sharp(screenshot)
-        .webp({
-          quality: 80,
-          effort: 4,
-          lossless: false
-        })
-        .toBuffer();
-
-      // Sauvegarder dans les caches
-      await fs.writeFile(cachedFile, optimizedImage);
-      memoryCache.set(hash, optimizedImage);
-
-      return { image: optimizedImage, cached: false };
-    } finally {
-      await pagePool.release(page);
+    } catch (error) {
+      console.error('Error in generateImage:', error);
+      throw error;
     }
   }
+
+  // Modify the route handler
+  app.get("/image", async (req, res) => {
+    console.log('GET request received at:', new Date().toISOString());
+    
+    if (!req.query.html) {
+      console.log('No HTML provided');
+      return res.status(400).json({ error: "HTML parameter is required" });
+    }
+  
+    try {
+      console.log('Processing request...');
+      const result = await generateImage(decodeURIComponent(req.query.html), {});
+      console.log('Image generated successfully');
+  
+      res.set({
+        'Content-Type': 'image/jpeg',
+        'Content-Length': result.length
+      });
+      res.end(result);
+      console.log('Response sent');
+    } catch (err) {
+      console.error('Request failed:', err);
+      res.status(500).json({ error: err.message || "Internal server error" });
+    }
+  });
 
   // Traitement des jobs
   queue.process(async (job) => {
