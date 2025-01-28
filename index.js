@@ -89,188 +89,197 @@ if (cluster.isMaster) {
   let browser;
   let pagePool;
 
-  // Configuration Express (keep only this one)
-  const app = express();
-  app.use(compression());
-  app.use(express.json({ limit: "2mb" }));
-
-  // Queue configuration and error handling
-  const queue = new Queue("image-generation", {
-    limiter: {
-      max: CONFIG.MAX_CONCURRENT_JOBS,
-      duration: 1000
-    },
-    defaultJobOptions: {
-      removeOnComplete: true,
-      removeOnFail: true,
-      timeout: CONFIG.PAGE_TIMEOUT
+  // Gestionnaire de pages optimisé
+  class PagePool {
+    constructor() {
+      this.pages = [];
+      this.maxSize = 5;
     }
-  });
 
-  queue.on('error', (error) => {
-    console.error('Queue error:', error);
-  });
+    async initialize(browser) {
+      for (let i = 0; i < this.maxSize; i++) {
+        const page = await this.createOptimizedPage(browser);
+        this.pages.push({ page, inUse: false, lastUsed: Date.now() });
+      }
+    }
 
-  queue.on('failed', (job, error) => {
-    console.error('Job failed:', error);
-  });
+    // Queue configuration and error handling
+    const queue = new Queue("image-generation", {
+      limiter: {
+        max: CONFIG.MAX_CONCURRENT_JOBS,
+        duration: 1000
+      },
+      defaultJobOptions: {
+        removeOnComplete: true,
+        removeOnFail: true,
+        timeout: CONFIG.PAGE_TIMEOUT
+      }
+    });
 
-  // Generate Image function definition
-  async function generateImage(html, options = {}) {
-    console.log('Starting image generation...');
-    try {
-      const hash = crypto.createHash("md5")
-        .update(html + JSON.stringify(options))
-        .digest("hex");
+    queue.on('error', (error) => {
+      console.error('Queue error:', error);
+    });
+
+    queue.on('failed', (job, error) => {
+      console.error('Job failed:', error);
+    });
+
+    // Generate Image function definition
+    async function generateImage(html, options = {}) {
+      console.log('Starting image generation...');
+      try {
+        const hash = crypto.createHash("md5")
+          .update(html + JSON.stringify(options))
+          .digest("hex");
+        
+        console.log('Generated hash:', hash);
+        
+        const page = await pagePool.acquire();
+        console.log('Acquired page from pool');
+    
+        try {
+          const { width = 1280, height = 720, fullPage = true } = options;
+          console.log('Setting viewport:', { width, height });
+    
+          await page.setViewport({ width, height, deviceScaleFactor: 1 });
+          console.log('Viewport set, setting content...');
+    
+          await page.setContent(html, { waitUntil: "domcontentloaded" });
+          console.log('Content set, taking screenshot...');
+    
+          const screenshot = await page.screenshot({
+            fullPage,
+            type: 'jpeg',
+            quality: 90
+          });
+          console.log('Screenshot taken');
+    
+          return screenshot;
+        } finally {
+          await pagePool.release(page);
+          console.log('Page released back to pool');
+        }
+      } catch (error) {
+        console.error('Error in generateImage:', error);
+        throw error;
+      }
+    }
+
+    // Route definitions
+    app.get("/image", async (req, res) => {
+      console.log('GET request received at:', new Date().toISOString());
       
-      console.log('Generated hash:', hash);
-      
-      const page = await pagePool.acquire();
-      console.log('Acquired page from pool');
+      if (!req.query.html) {
+        console.log('No HTML provided');
+        return res.status(400).json({ error: "HTML parameter is required" });
+      }
+    
+      try {
+        console.log('Processing request...');
+        const result = await generateImage(decodeURIComponent(req.query.html), {});
+        console.log('Image generated successfully');
+    
+        res.set({
+          'Content-Type': 'image/jpeg',
+          'Content-Length': result.length
+        });
+        res.end(result);
+        console.log('Response sent');
+      } catch (err) {
+        console.error('Request failed:', err);
+        res.status(500).json({ error: err.message || "Internal server error" });
+      }
+    });
+
+    // Traitement des jobs
+    queue.process(async (job) => {
+      const { html, options } = job.data;
+      const result = await generateImage(html, options);
+      return result.image;
+    });
+
+    // Remove this duplicate Express configuration
+    // const app = express();
+    // app.use(compression());
+    // app.use(express.json({ limit: "2mb" }));
+
+    // Routes
+    app.post("/image", async (req, res) => {
+      console.log('Received POST request:', req.body);
+      const { html, options } = req.body;
+  
+      if (!html) {
+        console.log('No HTML content provided');
+        return res.status(400).json({ error: "HTML content is required" });
+      }
   
       try {
-        const { width = 1280, height = 720, fullPage = true } = options;
-        console.log('Setting viewport:', { width, height });
+        console.log('Adding job to queue...');
+        const job = await queue.add({ html, options: options || {} });
+        
+        console.log('Waiting for job to complete...');
+        const result = await job.finished();
+        console.log('Job completed, sending response...');
   
-        await page.setViewport({ width, height, deviceScaleFactor: 1 });
-        console.log('Viewport set, setting content...');
-  
-        await page.setContent(html, { waitUntil: "domcontentloaded" });
-        console.log('Content set, taking screenshot...');
-  
-        const screenshot = await page.screenshot({
-          fullPage,
-          type: 'jpeg',
-          quality: 90
+        res.set({
+          'Content-Type': 'image/webp',
+          'Cache-Control': 'public, max-age=3600',
+          'X-Generated-By': `Worker-${cluster.worker.id}`
         });
-        console.log('Screenshot taken');
-  
-        return screenshot;
-      } finally {
-        await pagePool.release(page);
-        console.log('Page released back to pool');
+        
+        res.end(Buffer.from(result));
+      } catch (err) {
+        console.error("Generation error:", err);
+        res.status(500).json({ 
+          error: "Image generation failed",
+          details: process.env.NODE_ENV === 'development' ? err.message : undefined
+        });
       }
-    } catch (error) {
-      console.error('Error in generateImage:', error);
-      throw error;
-    }
-  }
+    });
 
-  // Route definitions
-  app.get("/image", async (req, res) => {
-    console.log('GET request received at:', new Date().toISOString());
-    
-    if (!req.query.html) {
-      console.log('No HTML provided');
-      return res.status(400).json({ error: "HTML parameter is required" });
+    // Gestion d'erreurs
+    app.use((err, req, res, next) => {
+      console.error('Unhandled error:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    });
+
+    // Initialisation
+    async function initialize() {
+      try {
+        browser = await puppeteer.launch(CONFIG.BROWSER_CONFIG);
+        pagePool = new PagePool();
+        await pagePool.initialize(browser);
+        
+        app.listen(CONFIG.PORT, () => {
+          console.log(`Worker ${cluster.worker.id} running on port ${CONFIG.PORT}`);
+        });
+  
+        // Nettoyage périodique des pages
+        setInterval(() => pagePool.cleanup(), 300000);
+  
+        // Monitoring mémoire
+        setInterval(() => {
+          const used = process.memoryUsage().heapUsed;
+          if (used > CONFIG.MEMORY_LIMIT) {
+            pagePool.cleanup();
+          }
+        }, 60000);
+  
+      } catch (err) {
+        console.error('Initialization failed:', err);
+        process.exit(1);
+      }
     }
   
-    try {
-      console.log('Processing request...');
-      const result = await generateImage(decodeURIComponent(req.query.html), {});
-      console.log('Image generated successfully');
+    // Gestion de l'arrêt
+    async function shutdown() {
+      if (browser) await browser.close();
+      await queue.close();
+      process.exit(0);
+    }
   
-      res.set({
-        'Content-Type': 'image/jpeg',
-        'Content-Length': result.length
-      });
-      res.end(result);
-      console.log('Response sent');
-    } catch (err) {
-      console.error('Request failed:', err);
-      res.status(500).json({ error: err.message || "Internal server error" });
-    }
-  });
-
-  // Traitement des jobs
-  queue.process(async (job) => {
-    const { html, options } = job.data;
-    const result = await generateImage(html, options);
-    return result.image;
-  });
-
-  // Remove this duplicate Express configuration
-  // const app = express();
-  // app.use(compression());
-  // app.use(express.json({ limit: "2mb" }));
-
-  // Routes
-  app.post("/image", async (req, res) => {
-    console.log('Received POST request:', req.body);
-    const { html, options } = req.body;
-
-    if (!html) {
-      console.log('No HTML content provided');
-      return res.status(400).json({ error: "HTML content is required" });
-    }
-
-    try {
-      console.log('Adding job to queue...');
-      const job = await queue.add({ html, options: options || {} });
-      
-      console.log('Waiting for job to complete...');
-      const result = await job.finished();
-      console.log('Job completed, sending response...');
-
-      res.set({
-        'Content-Type': 'image/webp',
-        'Cache-Control': 'public, max-age=3600',
-        'X-Generated-By': `Worker-${cluster.worker.id}`
-      });
-      
-      res.end(Buffer.from(result));
-    } catch (err) {
-      console.error("Generation error:", err);
-      res.status(500).json({ 
-        error: "Image generation failed",
-        details: process.env.NODE_ENV === 'development' ? err.message : undefined
-      });
-    }
-  });
-
-  // Gestion d'erreurs
-  app.use((err, req, res, next) => {
-    console.error('Unhandled error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  });
-
-  // Initialisation
-  async function initialize() {
-    try {
-      browser = await puppeteer.launch(CONFIG.BROWSER_CONFIG);
-      pagePool = new PagePool();
-      await pagePool.initialize(browser);
-      
-      app.listen(CONFIG.PORT, () => {
-        console.log(`Worker ${cluster.worker.id} running on port ${CONFIG.PORT}`);
-      });
-
-      // Nettoyage périodique des pages
-      setInterval(() => pagePool.cleanup(), 300000);
-
-      // Monitoring mémoire
-      setInterval(() => {
-        const used = process.memoryUsage().heapUsed;
-        if (used > CONFIG.MEMORY_LIMIT) {
-          pagePool.cleanup();
-        }
-      }, 60000);
-
-    } catch (err) {
-      console.error('Initialization failed:', err);
-      process.exit(1);
-    }
-  }
-
-  // Gestion de l'arrêt
-  async function shutdown() {
-    if (browser) await browser.close();
-    await queue.close();
-    process.exit(0);
-  }
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-
-  initialize();
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+  
+    initialize();
 }
