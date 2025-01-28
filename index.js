@@ -203,21 +203,29 @@ if (cluster.isMaster) {
   
   // Route handlers
   app.get("/image", async (req, res) => {
+    console.log('GET request received at:', new Date().toISOString());
+    
     if (!req.query.html) {
+      console.log('No HTML provided');
       return res.status(400).json({ error: "HTML parameter is required" });
     }
     
     try {
+      // Direct generation without queue
+      console.log('Processing request directly...');
       const result = await generateImage(decodeURIComponent(req.query.html), {});
+      console.log('Image generated successfully');
+    
       res.set({
         'Content-Type': 'image/jpeg',
         'Content-Length': result.length,
         'Cache-Control': 'public, max-age=3600'
       });
       res.end(result);
+      console.log('Response sent');
     } catch (err) {
       console.error('Request failed:', err);
-      res.status(500).json({ error: "Internal server error" });
+      res.status(500).json({ error: err.message || "Internal server error" });
     }
   });
   
