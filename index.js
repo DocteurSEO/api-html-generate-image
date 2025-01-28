@@ -173,31 +173,60 @@ if (cluster.isMaster) {
   
   // Image generation function
   const generateImage = async (html, options = {}) => {
+    console.log('Starting image generation process...');
+    
     const hash = crypto.createHash("md5")
       .update(html + JSON.stringify(options))
       .digest("hex");
     
-    // Check cache
+    console.log('Checking cache...');
     const cached = memoryCache.get(hash);
-    if (cached) return cached;
+    if (cached) {
+      console.log('Cache hit, returning cached image');
+      return cached;
+    }
     
-    const page = await pagePool.acquire();
+    console.log('Acquiring page from pool...');
+    let page;
     try {
+      page = await pagePool.acquire();
+    } catch (error) {
+      console.error('Failed to acquire page:', error);
+      throw new Error('Failed to initialize page');
+    }
+  
+    try {
+      console.log('Setting up page...');
       const { width = 1280, height = 720, fullPage = true } = options;
       
       await page.setViewport({ width, height, deviceScaleFactor: 1 });
-      await page.setContent(html, { waitUntil: "domcontentloaded" });
+      console.log('Viewport set, loading content...');
       
+      await Promise.race([
+        page.setContent(html, { waitUntil: "domcontentloaded" }),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Content load timeout')), 10000)
+        )
+      ]);
+      
+      console.log('Content loaded, taking screenshot...');
       const screenshot = await page.screenshot({
         fullPage,
         type: 'jpeg',
         quality: 90
       });
       
+      console.log('Screenshot taken, caching result...');
       memoryCache.set(hash, screenshot);
       return screenshot;
+    } catch (error) {
+      console.error('Error during image generation:', error);
+      throw error;
     } finally {
-      await pagePool.release(page);
+      if (page) {
+        console.log('Releasing page back to pool...');
+        await pagePool.release(page).catch(console.error);
+      }
     }
   };
   
