@@ -12,13 +12,13 @@ const compression = require("compression");
 // Configuration
 const CONFIG = {
   PORT: process.env.PORT || 3001,
-  WORKERS: process.env.WORKERS || os.cpus().length,
+  WORKERS: 1,  // Reduced to 1 worker due to limited CPU
   CACHE_DIR: "./cache",
-  MAX_MEMORY_CACHE: 200,
+  MAX_MEMORY_CACHE: 50,  // Reduced for memory constraints
   CLEANUP_INTERVAL: 3600000,
-  PAGE_TIMEOUT: 15000,
-  REQUEST_TIMEOUT: 30000,
-  MAX_CONCURRENT_JOBS: 5,
+  PAGE_TIMEOUT: 10000,  // Reduced timeout
+  REQUEST_TIMEOUT: 15000,
+  MAX_CONCURRENT_JOBS: 2,  // Reduced concurrent jobs
   MEMORY_LIMIT: 512 * 1024 * 1024,
   BROWSER_CONFIG: {
     headless: "new",
@@ -33,7 +33,16 @@ const CONFIG = {
       '--js-flags=--max-old-space-size=512',
       '--single-process',
       '--disable-web-security',
-      '--enable-low-end-device-mode'
+      '--enable-low-end-device-mode',
+      '--no-zygote',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--disable-translate',
+      '--hide-scrollbars',
+      '--metrics-recording-only',
+      '--mute-audio',
+      '--no-first-run'
     ]
   }
 };
@@ -47,7 +56,7 @@ const memoryCache = new LRU({
 });
 
 class PagePool {
-  constructor(maxSize = 5) {
+  constructor(maxSize = 2) {  // Reduced pool size
     this.pages = [];
     this.maxSize = maxSize;
   }
@@ -173,60 +182,36 @@ if (cluster.isMaster) {
   
   // Image generation function
   const generateImage = async (html, options = {}) => {
-    console.log('Starting image generation process...');
-    
     const hash = crypto.createHash("md5")
       .update(html + JSON.stringify(options))
       .digest("hex");
     
-    console.log('Checking cache...');
     const cached = memoryCache.get(hash);
-    if (cached) {
-      console.log('Cache hit, returning cached image');
-      return cached;
-    }
+    if (cached) return cached;
     
-    console.log('Acquiring page from pool...');
-    let page;
+    const page = await pagePool.acquire();
     try {
-      page = await pagePool.acquire();
-    } catch (error) {
-      console.error('Failed to acquire page:', error);
-      throw new Error('Failed to initialize page');
-    }
-  
-    try {
-      console.log('Setting up page...');
-      const { width = 1280, height = 720, fullPage = true } = options;
+      const { width = 800, height = 600, fullPage = false } = options;  // Reduced default size
       
       await page.setViewport({ width, height, deviceScaleFactor: 1 });
-      console.log('Viewport set, loading content...');
-      
       await Promise.race([
-        page.setContent(html, { waitUntil: "domcontentloaded" }),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Content load timeout')), 10000)
-        )
+        page.setContent(html, { 
+          waitUntil: "domcontentloaded",
+          timeout: 5000 
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
       ]);
       
-      console.log('Content loaded, taking screenshot...');
       const screenshot = await page.screenshot({
         fullPage,
         type: 'jpeg',
-        quality: 90
+        quality: 80  // Reduced quality for better performance
       });
       
-      console.log('Screenshot taken, caching result...');
       memoryCache.set(hash, screenshot);
       return screenshot;
-    } catch (error) {
-      console.error('Error during image generation:', error);
-      throw error;
     } finally {
-      if (page) {
-        console.log('Releasing page back to pool...');
-        await pagePool.release(page).catch(console.error);
-      }
+      await pagePool.release(page);
     }
   };
   
