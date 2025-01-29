@@ -48,7 +48,7 @@ async function initializePage() {
     await page.setRequestInterception(true);
     
     page.on('request', request => {
-      if (['image', 'font', 'media'].includes(request.resourceType())) {
+      if (['media'].includes(request.resourceType())) {
         request.abort();
       } else {
         request.continue();
