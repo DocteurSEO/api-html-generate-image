@@ -36,7 +36,7 @@ const cache = new LRU({
 const app = express();
 app.use(cors());
 app.use(compression());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 let browser;
 let page;
@@ -48,7 +48,7 @@ async function initializePage() {
     await page.setRequestInterception(true);
     
     page.on('request', request => {
-      if (['image', 'stylesheet', 'font', 'media'].includes(request.resourceType())) {
+      if (['image', 'font', 'media'].includes(request.resourceType())) {
         request.abort();
       } else {
         request.continue();
@@ -67,37 +67,55 @@ async function generateImage(html, options = {}) {
 
   try {
     const page = await initializePage();
-    const { width = 800, height = 600 } = options;
+    const { width = 800, height = 600, quality = 80, format = 'jpeg' } = options;
 
     await page.setViewport({ width, height, deviceScaleFactor: 1 });
-    await page.setContent(html, { waitUntil: "domcontentloaded", timeout: CONFIG.PAGE_TIMEOUT });
-
-    const screenshot = await page.screenshot({
-      type: 'jpeg',
-      quality: 80,
-      fullPage: false
+    await page.setContent(html, { 
+      waitUntil: ["load", "networkidle0"],
+      timeout: CONFIG.PAGE_TIMEOUT 
     });
 
-    cache.set(hash, screenshot);
-    return screenshot;
+    // Use evaluate to wait for any animations or transitions to complete
+    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1000)));
+
+    let output;
+    if (format.toLowerCase() === 'pdf') {
+      output = await page.pdf({
+        width: `${width}px`,
+        height: `${height}px`,
+        printBackground: true
+      });
+    } else {
+      output = await page.screenshot({
+        type: format.toLowerCase(),
+        quality: format.toLowerCase() === 'jpeg' ? quality : undefined,
+        fullPage: false,
+        omitBackground: false
+      });
+    }
+
+    cache.set(hash, output);
+    return output;
   } catch (error) {
     console.error('Generation error:', error);
+    console.error('HTML content:', html);
     throw error;
   }
 }
 
 // Routes simplifiées
-app.get("/image", async (req, res) => {
+// Add a new POST endpoint
+app.post("/image", async (req, res) => {
   try {
-    if (!req.query.html) {
+    if (!req.body.html) {
       return res.status(400).json({ error: "HTML required" });
     }
 
-    // Extract and validate image options from query parameters
     const options = {
-      width: parseInt(req.query.width) || 800,
-      height: parseInt(req.query.height) || 600,
-      quality: parseInt(req.query.quality) || 80
+      width: parseInt(req.body.width) || 800,
+      height: parseInt(req.body.height) || 600,
+      quality: parseInt(req.body.quality) || 80,
+      format: req.body.format || 'jpeg'
     };
 
     // Validate dimensions
@@ -110,14 +128,77 @@ app.get("/image", async (req, res) => {
       return res.status(400).json({ error: "Invalid quality. Must be between 1 and 100" });
     }
 
-    const result = await generateImage(decodeURIComponent(req.query.html), options);
+    // Validate format
+    if (!['jpeg', 'png', 'pdf'].includes(options.format.toLowerCase())) {
+      return res.status(400).json({ error: "Invalid format. Must be jpeg, png, or pdf" });
+    }
+
+    const result = await generateImage(req.body.html, options);
     
     res.set({
-      'Content-Type': 'image/jpeg',
+      'Content-Type': options.format.toLowerCase() === 'pdf' ? 'application/pdf' : `image/${options.format}`,
       'Cache-Control': 'public, max-age=3600'
     });
     res.end(result);
   } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: "Generation failed" });
+  }
+});
+
+// Keep the GET endpoint for backward compatibility
+app.get("/image", async (req, res) => {
+  try {
+    let html;
+    
+    if (req.query.url) {
+      try {
+        const page = await initializePage();
+        await page.goto(req.query.url, {
+          waitUntil: ['load', 'networkidle0'],
+          timeout: CONFIG.PAGE_TIMEOUT
+        });
+        html = await page.content();
+      } catch (error) {
+        return res.status(400).json({ error: "Failed to load URL" });
+      }
+    } else if (req.query.html) {
+      html = decodeURIComponent(req.query.html);
+    } else {
+      return res.status(400).json({ error: "URL or HTML required" });
+    }
+
+    const options = {
+      width: parseInt(req.query.width) || parseInt(req.query.w) || 800,
+      height: parseInt(req.query.height) || parseInt(req.query.h) || 600,
+      quality: parseInt(req.query.quality) || parseInt(req.query.q) || 80,
+      format: req.query.format || 'jpeg'
+    };
+
+    // Validate dimensions
+    if (options.width < 1 || options.width > 4000 || options.height < 1 || options.height > 4000) {
+      return res.status(400).json({ error: "Invalid dimensions. Width and height must be between 1 and 4000 pixels" });
+    }
+
+    // Validate quality
+    if (options.quality < 1 || options.quality > 100) {
+      return res.status(400).json({ error: "Invalid quality. Must be between 1 and 100" });
+    }
+
+    // Validate format
+    if (!['jpeg', 'png', 'pdf'].includes(options.format.toLowerCase())) {
+      return res.status(400).json({ error: "Invalid format. Must be jpeg, png, or pdf" });
+    }
+
+    const result = await generateImage(html, options);
+    
+    res.set({
+      'Content-Type': options.format.toLowerCase() === 'pdf' ? 'application/pdf' : `image/${options.format}`,
+      'Cache-Control': 'public, max-age=3600'
+    });
+    res.end(result);
+  } catch (error) {
+    console.error('Error:', error);
     res.status(500).json({ error: "Generation failed" });
   }
 });
