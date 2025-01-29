@@ -6,13 +6,12 @@ const LRU = require("lru-cache");
 const compression = require("compression");
 const cors = require("cors");
 
-// Optimized configuration for low-resource environment
+// Configuration optimisée
 const CONFIG = {
   PORT: process.env.PORT || 3001,
-  CACHE_MAX_ITEMS: 10, // Reduced from 20
-  CACHE_TTL: 900000, // Reduced to 15 minutes
-  PAGE_TIMEOUT: 10000, // Increased timeout for slower CPU
-  CONCURRENT_JOBS: 2, // Limit concurrent jobs
+  CACHE_MAX_ITEMS: 20,
+  CACHE_TTL: 1800000, // 30 minutes
+  PAGE_TIMEOUT: 5000,
   BROWSER_CONFIG: {
     headless: "new",
     args: [
@@ -22,33 +21,15 @@ const CONFIG = {
       '--disable-gpu',
       '--disable-extensions',
       '--js-flags=--max-old-space-size=512',
-      '--single-process',
-      '--disable-accelerated-2d-canvas',
-      '--disable-canvas-aa',
-      '--disable-2d-canvas-clip-aa',
-      '--disable-gl-drawing-for-tests'
+      '--single-process'
     ]
   }
 };
 
-// Lightweight cache configuration
+// Cache simple et léger
 const cache = new LRU({
   max: CONFIG.CACHE_MAX_ITEMS,
-  ttl: CONFIG.CACHE_TTL,
-  updateAgeOnGet: true
-});
-
-// Queue configuration
-const imageQueue = new Queue('image-generation', {
-  defaultJobOptions: {
-    attempts: 2,
-    removeOnComplete: true,
-    removeOnFail: true
-  },
-  limiter: {
-    max: CONFIG.CONCURRENT_JOBS,
-    duration: 1000 // 1 second
-  }
+  ttl: CONFIG.CACHE_TTL
 });
 
 // Application Express
@@ -58,40 +39,34 @@ app.use(compression());
 app.use(express.json({ limit: "10mb" }));
 
 let browser;
+let page;
 
-// Remove the global page variable and modify initializePage to always create a new page
+// Initialisation optimisée de la page
 async function initializePage() {
-  const page = await browser.newPage();
-  await page.setRequestInterception(true);
-  
-  page.on('request', request => {
-    if (['image', 'font', 'media'].includes(request.resourceType())) {
-      request.abort();
-    } else {
-      request.continue();
-    }
-  });
+  if (!page) {
+    page = await browser.newPage();
+    await page.setRequestInterception(true);
+    
+    page.on('request', request => {
+      if (['image', 'font', 'media'].includes(request.resourceType())) {
+        request.abort();
+      } else {
+        request.continue();
+      }
+    });
+  }
   return page;
 }
 
-// Optimized image generation function
+// Fonction de génération d'image optimisée
 async function generateImage(html, options = {}) {
   const hash = crypto.createHash("md5").update(html + JSON.stringify(options)).digest("hex");
   
   const cached = cache.get(hash);
   if (cached) return cached;
 
-  return imageQueue.add({ html, options }, {
-    timeout: CONFIG.PAGE_TIMEOUT + 5000
-  });
-}
-
-// Queue process handler
-imageQueue.process(async (job) => {
-  let page;
-  const { html, options } = job.data;
   try {
-    page = await initializePage();
+    const page = await initializePage();
     const { width = 800, height = 600, quality = 80, format = 'jpeg' } = options;
 
     await page.setViewport({ width, height, deviceScaleFactor: 1 });
@@ -100,8 +75,8 @@ imageQueue.process(async (job) => {
       timeout: CONFIG.PAGE_TIMEOUT 
     });
 
-    // Minimal wait time for animations
-    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 500)));
+    // Use evaluate to wait for any animations or transitions to complete
+    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1000)));
 
     let output;
     if (format.toLowerCase() === 'pdf') {
@@ -123,19 +98,13 @@ imageQueue.process(async (job) => {
     return output;
   } catch (error) {
     console.error('Generation error:', error);
+    console.error('HTML content:', html);
     throw error;
-  } finally {
-    if (page) {
-      try {
-        await page.close().catch(e => console.error('Error closing page:', e));
-      } catch (e) {
-        console.error('Error in finally block while closing page:', e);
-      }
-    }
   }
-});
+}
 
-// Routes with queue integration
+// Routes simplifiées
+// Add a new POST endpoint
 app.post("/image", async (req, res) => {
   try {
     if (!req.body.html) {
@@ -257,12 +226,11 @@ async function shutdown() {
   console.log('Shutting down gracefully...');
   try {
     if (browser) await browser.close();
-    await imageQueue.close();
     server.close(() => {
       console.log('Server closed');
       process.exit(0);
     });
-    
+    // add 
     // Force exit if graceful shutdown fails
     setTimeout(() => {
       console.error('Could not close connections in time, forcefully shutting down');
@@ -284,15 +252,14 @@ async function initialize() {
       console.log(`Server running on port ${CONFIG.PORT}`);
     });
 
-    // Memory monitoring with more aggressive thresholds
+    // Surveillance mémoire
     setInterval(() => {
       const used = process.memoryUsage().heapUsed / 1024 / 1024;
-      if (used > 700) { // Lowered threshold to 700MB
+      if (used > 800) { // 800MB threshold
         cache.clear();
-        global.gc && global.gc(); // Force garbage collection if available
-        console.log('Memory threshold reached, cache cleared');
+        console.log('Memory limit reached, cache cleared');
       }
-    }, 15000); // More frequent checks
+    }, 30000);
 
   } catch (error) {
     console.error('Initialization failed:', error);
