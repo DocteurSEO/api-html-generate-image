@@ -6,12 +6,13 @@ const LRU = require("lru-cache");
 const compression = require("compression");
 const cors = require("cors");
 
-// Configuration optimisée
+// Optimized configuration for low-resource environment
 const CONFIG = {
   PORT: process.env.PORT || 3001,
-  CACHE_MAX_ITEMS: 20,
-  CACHE_TTL: 1800000, // 30 minutes
-  PAGE_TIMEOUT: 5000,
+  CACHE_MAX_ITEMS: 10, // Reduced from 20
+  CACHE_TTL: 900000, // Reduced to 15 minutes
+  PAGE_TIMEOUT: 10000, // Increased timeout for slower CPU
+  CONCURRENT_JOBS: 2, // Limit concurrent jobs
   BROWSER_CONFIG: {
     headless: "new",
     args: [
@@ -21,15 +22,33 @@ const CONFIG = {
       '--disable-gpu',
       '--disable-extensions',
       '--js-flags=--max-old-space-size=512',
-      '--single-process'
+      '--single-process',
+      '--disable-accelerated-2d-canvas',
+      '--disable-canvas-aa',
+      '--disable-2d-canvas-clip-aa',
+      '--disable-gl-drawing-for-tests'
     ]
   }
 };
 
-// Cache simple et léger
+// Lightweight cache configuration
 const cache = new LRU({
   max: CONFIG.CACHE_MAX_ITEMS,
-  ttl: CONFIG.CACHE_TTL
+  ttl: CONFIG.CACHE_TTL,
+  updateAgeOnGet: true
+});
+
+// Queue configuration
+const imageQueue = new Queue('image-generation', {
+  defaultJobOptions: {
+    attempts: 2,
+    removeOnComplete: true,
+    removeOnFail: true
+  },
+  limiter: {
+    max: CONFIG.CONCURRENT_JOBS,
+    duration: 1000 // 1 second
+  }
 });
 
 // Application Express
@@ -58,13 +77,21 @@ async function initializePage() {
   return page;
 }
 
-// Fonction de génération d'image optimisée
+// Optimized image generation function
 async function generateImage(html, options = {}) {
   const hash = crypto.createHash("md5").update(html + JSON.stringify(options)).digest("hex");
   
   const cached = cache.get(hash);
   if (cached) return cached;
 
+  return imageQueue.add({ html, options }, {
+    timeout: CONFIG.PAGE_TIMEOUT + 5000
+  });
+}
+
+// Queue process handler
+imageQueue.process(async (job) => {
+  const { html, options } = job.data;
   try {
     const page = await initializePage();
     const { width = 800, height = 600, quality = 80, format = 'jpeg' } = options;
@@ -75,8 +102,8 @@ async function generateImage(html, options = {}) {
       timeout: CONFIG.PAGE_TIMEOUT 
     });
 
-    // Use evaluate to wait for any animations or transitions to complete
-    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1000)));
+    // Minimal wait time for animations
+    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 500)));
 
     let output;
     if (format.toLowerCase() === 'pdf') {
@@ -98,13 +125,19 @@ async function generateImage(html, options = {}) {
     return output;
   } catch (error) {
     console.error('Generation error:', error);
-    console.error('HTML content:', html);
     throw error;
+  } finally {
+    if (page) {
+      try {
+        await page.close();
+      } catch (e) {
+        console.error('Error closing page:', e);
+      }
+    }
   }
-}
+});
 
-// Routes simplifiées
-// Add a new POST endpoint
+// Routes with queue integration
 app.post("/image", async (req, res) => {
   try {
     if (!req.body.html) {
@@ -226,6 +259,7 @@ async function shutdown() {
   console.log('Shutting down gracefully...');
   try {
     if (browser) await browser.close();
+    await imageQueue.close();
     server.close(() => {
       console.log('Server closed');
       process.exit(0);
@@ -252,14 +286,15 @@ async function initialize() {
       console.log(`Server running on port ${CONFIG.PORT}`);
     });
 
-    // Surveillance mémoire
+    // Memory monitoring with more aggressive thresholds
     setInterval(() => {
       const used = process.memoryUsage().heapUsed / 1024 / 1024;
-      if (used > 800) { // 800MB threshold
+      if (used > 700) { // Lowered threshold to 700MB
         cache.clear();
-        console.log('Memory limit reached, cache cleared');
+        global.gc && global.gc(); // Force garbage collection if available
+        console.log('Memory threshold reached, cache cleared');
       }
-    }, 30000);
+    }, 15000); // More frequent checks
 
   } catch (error) {
     console.error('Initialization failed:', error);
