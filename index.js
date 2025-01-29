@@ -5,13 +5,17 @@ const crypto = require("crypto");
 const LRU = require("lru-cache");
 const compression = require("compression");
 const cors = require("cors");
+const cluster = require("cluster");
+const numCPUs = require("os").cpus().length;
 
-// Configuration optimisée
+// Configuration
 const CONFIG = {
   PORT: process.env.PORT || 3001,
-  CACHE_MAX_ITEMS: 20,
-  CACHE_TTL: 1800000, // 30 minutes
+  CACHE_MAX_ITEMS: 100,
+  CACHE_TTL: 1800000,
   PAGE_TIMEOUT: 5000,
+  BROWSER_POOL_SIZE: 3,
+  REDIS_URL: process.env.REDIS_URL || "redis://localhost:6379",
   BROWSER_CONFIG: {
     headless: "new",
     args: [
@@ -20,51 +24,63 @@ const CONFIG = {
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--disable-extensions',
-      '--js-flags=--max-old-space-size=512',
-      '--single-process',
-      '--font-render-hinting=medium',
-      '--enable-font-antialiasing',
-      '--force-color-profile=srgb',
-      '--font-render-hinting=none',
-      '--disable-lcd-text',
-      '--enable-harfbuzz-rendertext',
-      '--enable-native-gpu-memory-buffers'
-    ],
-    ignoreDefaultArgs: ['--disable-font-subpixel-positioning']
+      '--js-flags=--max-old-space-size=512'
+    ]
   }
 };
 
-// Cache simple et léger
+// File d'attente Bull
+const imageQueue = new Queue('image-generation', CONFIG.REDIS_URL);
+
+// Cache optimisé
 const cache = new LRU({
   max: CONFIG.CACHE_MAX_ITEMS,
-  ttl: CONFIG.CACHE_TTL
+  ttl: CONFIG.CACHE_TTL,
+  updateAgeOnGet: true
 });
 
-// Application Express
-const app = express();
-app.use(cors());
-app.use(compression());
-app.use(express.json({ limit: "10mb" }));
+// Pool de navigateurs
+class BrowserPool {
+  constructor() {
+    this.browsers = [];
+    this.pages = [];
+    this.currentIndex = 0;
+  }
 
-let browser;
-let page;
+  async initialize() {
+    for (let i = 0; i < CONFIG.BROWSER_POOL_SIZE; i++) {
+      const browser = await puppeteer.launch(CONFIG.BROWSER_CONFIG);
+      const page = await browser.newPage();
+      await this.setupPage(page);
+      
+      this.browsers.push(browser);
+      this.pages.push(page);
+    }
+  }
 
-// Initialisation optimisée de la page
-async function initializePage() {
-  if (!page) {
-    page = await browser.newPage();
+  async setupPage(page) {
     await page.setRequestInterception(true);
-    
     page.on('request', request => {
-      if (['media'].includes(request.resourceType())) {
+      if (['media', 'font', 'image'].includes(request.resourceType())) {
         request.abort();
       } else {
         request.continue();
       }
     });
   }
-  return page;
+
+  getNextPage() {
+    const page = this.pages[this.currentIndex];
+    this.currentIndex = (this.currentIndex + 1) % this.pages.length;
+    return page;
+  }
+
+  async cleanup() {
+    await Promise.all(this.browsers.map(browser => browser.close()));
+  }
 }
+
+const browserPool = new BrowserPool();
 
 // Fonction de génération d'image optimisée
 async function generateImage(html, options = {}) {
@@ -73,8 +89,9 @@ async function generateImage(html, options = {}) {
   const cached = cache.get(hash);
   if (cached) return cached;
 
+  const page = browserPool.getNextPage();
+  
   try {
-    const page = await initializePage();
     const { width = 800, height = 600, quality = 80, format = 'jpeg' } = options;
 
     await page.setViewport({ width, height, deviceScaleFactor: 1 });
@@ -83,8 +100,16 @@ async function generateImage(html, options = {}) {
       timeout: CONFIG.PAGE_TIMEOUT 
     });
 
-    // Use evaluate to wait for any animations or transitions to complete
-    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1000)));
+    // Attente optimisée basée sur le contenu
+    await page.evaluate(() => {
+      return new Promise(resolve => {
+        if (document.readyState === 'complete') {
+          resolve();
+        } else {
+          window.addEventListener('load', resolve);
+        }
+      });
+    });
 
     let output;
     if (format.toLowerCase() === 'pdf') {
@@ -97,8 +122,7 @@ async function generateImage(html, options = {}) {
       output = await page.screenshot({
         type: format.toLowerCase(),
         quality: format.toLowerCase() === 'jpeg' ? quality : undefined,
-        fullPage: false,
-        omitBackground: false
+        fullPage: false
       });
     }
 
@@ -106,45 +130,49 @@ async function generateImage(html, options = {}) {
     return output;
   } catch (error) {
     console.error('Generation error:', error);
-    console.error('HTML content:', html);
     throw error;
   }
 }
 
-// Routes simplifiées
-// Add a new POST endpoint
+// Configuration du processeur de file d'attente
+imageQueue.process(async (job) => {
+  const { html, options } = job.data;
+  return await generateImage(html, options);
+});
+
+// Application Express
+const app = express();
+app.use(cors());
+app.use(compression());
+app.use(express.json({ limit: "50mb" }));
+
+// Routes optimisées
 app.post("/image", async (req, res) => {
   try {
-    if (!req.body.html) {
+    const { html, ...options } = req.body;
+    
+    if (!html) {
       return res.status(400).json({ error: "HTML required" });
     }
 
-    const options = {
-      width: parseInt(req.body.width) || 800,
-      height: parseInt(req.body.height) || 600,
-      quality: parseInt(req.body.quality) || 80,
-      format: req.body.format || 'jpeg'
-    };
-
-    // Validate dimensions
-    if (options.width < 1 || options.width > 4000 || options.height < 1 || options.height > 4000) {
-      return res.status(400).json({ error: "Invalid dimensions. Width and height must be between 1 and 4000 pixels" });
+    // Validation des options
+    const validatedOptions = validateOptions(options);
+    if (validatedOptions.error) {
+      return res.status(400).json({ error: validatedOptions.error });
     }
 
-    // Validate quality
-    if (options.quality < 1 || options.quality > 100) {
-      return res.status(400).json({ error: "Invalid quality. Must be between 1 and 100" });
+    // Ajout du job à la file d'attente
+    const job = await imageQueue.add({ html, options: validatedOptions });
+    
+    // Mode synchrone ou asynchrone selon le paramètre
+    if (req.query.async === 'true') {
+      return res.json({ jobId: job.id });
     }
 
-    // Validate format
-    if (!['jpeg', 'png', 'pdf'].includes(options.format.toLowerCase())) {
-      return res.status(400).json({ error: "Invalid format. Must be jpeg, png, or pdf" });
-    }
-
-    const result = await generateImage(req.body.html, options);
+    const result = await job.finished();
     
     res.set({
-      'Content-Type': options.format.toLowerCase() === 'pdf' ? 'application/pdf' : `image/${options.format}`,
+      'Content-Type': options.format === 'pdf' ? 'application/pdf' : `image/${options.format}`,
       'Cache-Control': 'public, max-age=3600'
     });
     res.end(result);
@@ -154,116 +182,88 @@ app.post("/image", async (req, res) => {
   }
 });
 
-// Keep the GET endpoint for backward compatibility
-app.get("/image", async (req, res) => {
+// Route pour vérifier le statut d'un job
+app.get("/status/:jobId", async (req, res) => {
   try {
-    let html;
+    const job = await imageQueue.getJob(req.params.jobId);
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+
+    const state = await job.getState();
+    const result = job.returnvalue;
     
-    if (req.query.url) {
-      try {
-        const page = await initializePage();
-        await page.goto(req.query.url, {
-          waitUntil: ['load', 'networkidle0'],
-          timeout: CONFIG.PAGE_TIMEOUT
-        });
-        html = await page.content();
-      } catch (error) {
-        return res.status(400).json({ error: "Failed to load URL" });
-      }
-    } else if (req.query.html) {
-      html = decodeURIComponent(req.query.html);
-    } else {
-      return res.status(400).json({ error: "URL or HTML required" });
+    if (state === 'completed' && result) {
+      res.set({
+        'Content-Type': job.data.options.format === 'pdf' ? 'application/pdf' : `image/${job.data.options.format}`,
+        'Cache-Control': 'public, max-age=3600'
+      });
+      return res.end(result);
     }
 
-    const options = {
-      width: parseInt(req.query.width) || parseInt(req.query.w) || 800,
-      height: parseInt(req.query.height) || parseInt(req.query.h) || 600,
-      quality: parseInt(req.query.quality) || parseInt(req.query.q) || 80,
-      format: req.query.format || 'jpeg'
-    };
-
-    // Validate dimensions
-    if (options.width < 1 || options.width > 4000 || options.height < 1 || options.height > 4000) {
-      return res.status(400).json({ error: "Invalid dimensions. Width and height must be between 1 and 4000 pixels" });
-    }
-
-    // Validate quality
-    if (options.quality < 1 || options.quality > 100) {
-      return res.status(400).json({ error: "Invalid quality. Must be between 1 and 100" });
-    }
-
-    // Validate format
-    if (!['jpeg', 'png', 'pdf'].includes(options.format.toLowerCase())) {
-      return res.status(400).json({ error: "Invalid format. Must be jpeg, png, or pdf" });
-    }
-
-    const result = await generateImage(html, options);
-    
-    res.set({
-      'Content-Type': options.format.toLowerCase() === 'pdf' ? 'application/pdf' : `image/${options.format}`,
-      'Cache-Control': 'public, max-age=3600'
-    });
-    res.end(result);
+    res.json({ state });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: "Generation failed" });
+    res.status(500).json({ error: "Status check failed" });
   }
 });
 
-// Gestion des erreurs
-app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  res.status(500).json({ error: 'Server error' });
-});
+// Fonction de validation des options
+function validateOptions(options) {
+  const validated = {
+    width: parseInt(options.width) || 800,
+    height: parseInt(options.height) || 600,
+    quality: parseInt(options.quality) || 80,
+    format: (options.format || 'jpeg').toLowerCase()
+  };
 
-// Initialisation et gestion de l'arrêt
-// Add these handlers at the top level
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-  shutdown();
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  shutdown();
-});
-
-// Modify the shutdown function
-async function shutdown() {
-  console.log('Shutting down gracefully...');
-  try {
-    if (browser) await browser.close();
-    server.close(() => {
-      console.log('Server closed');
-      process.exit(0);
-    });
-    // add 
-    // Force exit if graceful shutdown fails
-    setTimeout(() => {
-      console.error('Could not close connections in time, forcefully shutting down');
-      process.exit(1);
-    }, 10000);
-  } catch (error) {
-    console.error('Error during shutdown:', error);
-    process.exit(1);
+  if (validated.width < 1 || validated.width > 4000 || 
+      validated.height < 1 || validated.height > 4000) {
+    return { error: "Invalid dimensions" };
   }
+
+  if (validated.quality < 1 || validated.quality > 100) {
+    return { error: "Invalid quality" };
+  }
+
+  if (!['jpeg', 'png', 'pdf'].includes(validated.format)) {
+    return { error: "Invalid format" };
+  }
+
+  return validated;
 }
 
-// Modify the initialize function to store the server instance
+// Gestion du clustering
+if (cluster.isMaster) {
+  console.log(`Master ${process.pid} is running`);
+
+  // Fork workers
+  for (let i = 0; i < numCPUs; i++) {
+    cluster.fork();
+  }
+
+  cluster.on('exit', (worker, code, signal) => {
+    console.log(`Worker ${worker.process.pid} died`);
+    // Replace the dead worker
+    cluster.fork();
+  });
+} else {
+  // Workers can share any TCP connection
+  initialize();
+}
+
+// Initialisation
 async function initialize() {
   try {
-    browser = await puppeteer.launch(CONFIG.BROWSER_CONFIG);
-    await initializePage();
-
-    const server = app.listen(CONFIG.PORT, () => {
-      console.log(`Server running on port ${CONFIG.PORT}`);
+    await browserPool.initialize();
+    
+    app.listen(CONFIG.PORT, () => {
+      console.log(`Worker ${process.pid} started on port ${CONFIG.PORT}`);
     });
 
     // Surveillance mémoire
     setInterval(() => {
       const used = process.memoryUsage().heapUsed / 1024 / 1024;
-      if (used > 800) { // 800MB threshold
+      if (used > 800) {
         cache.clear();
         console.log('Memory limit reached, cache cleared');
       }
@@ -275,7 +275,20 @@ async function initialize() {
   }
 }
 
+// Gestion de l'arrêt gracieux
+async function shutdown() {
+  console.log('Shutting down gracefully...');
+  try {
+    await browserPool.cleanup();
+    await imageQueue.close();
+    process.exit(0);
+  } catch (error) {
+    console.error('Error during shutdown:', error);
+    process.exit(1);
+  }
+}
+
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
-
-initialize();
+process.on('uncaughtException', shutdown);
+process.on('unhandledRejection', shutdown);
