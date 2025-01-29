@@ -24,7 +24,11 @@ const CONFIG = {
       '--single-process',
       '--font-render-hinting=medium',
       '--enable-font-antialiasing',
-      '--force-color-profile=srgb'
+      '--force-color-profile=srgb',
+      '--font-render-hinting=none',
+      '--disable-lcd-text',
+      '--enable-harfbuzz-rendertext',
+      '--enable-native-gpu-memory-buffers'
     ],
     ignoreDefaultArgs: ['--disable-font-subpixel-positioning']
   }
