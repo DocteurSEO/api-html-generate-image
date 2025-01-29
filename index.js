@@ -5,114 +5,164 @@ const crypto = require("crypto");
 const LRU = require("lru-cache");
 const compression = require("compression");
 const cors = require("cors");
+const genericPool = require("generic-pool");
 const cluster = require("cluster");
-const numCPUs = require("os").cpus().length;
+const promClient = require('prom-client');
+const os = require('os');
 
 // Configuration
 const CONFIG = {
   PORT: process.env.PORT || 3001,
-  CACHE_MAX_ITEMS: 100,
-  CACHE_TTL: 1800000,
-  PAGE_TIMEOUT: 5000,
-  BROWSER_POOL_SIZE: 3,
-  REDIS_URL: process.env.REDIS_URL || "redis://localhost:6379",
+  CACHE_MAX_SIZE: 500000000, // 500MB
+  CACHE_TTL: 1800000, // 30 min
+  PAGE_TIMEOUT: 10000,
+  POOL: {
+    BROWSER: {
+      max: 4,
+      min: 2
+    },
+    PAGE: {
+      max: 10,
+      min: 5
+    }
+  },
   BROWSER_CONFIG: {
     headless: "new",
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-extensions',
       '--js-flags=--max-old-space-size=512'
     ]
   }
 };
 
-// File d'attente Bull
-const imageQueue = new Queue('image-generation', CONFIG.REDIS_URL);
+// Prometheus metrics
+const register = new promClient.Registry();
+const httpRequestDuration = new promClient.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'code'],
+  buckets: [0.1, 0.5, 1, 2, 5]
+});
+register.registerMetric(httpRequestDuration);
 
-// Cache optimisé
+// Cache with size tracking
 const cache = new LRU({
-  max: CONFIG.CACHE_MAX_ITEMS,
+  maxSize: CONFIG.CACHE_MAX_SIZE,
   ttl: CONFIG.CACHE_TTL,
-  updateAgeOnGet: true
+  sizeCalculation: (value) => value.length
 });
 
-// Pool de navigateurs
-class BrowserPool {
-  constructor() {
-    this.browsers = [];
-    this.pages = [];
-    this.currentIndex = 0;
-  }
+// Browser pool
+const browserPool = genericPool.createPool({
+  create: () => puppeteer.launch(CONFIG.BROWSER_CONFIG),
+  destroy: (browser) => browser.close()
+}, CONFIG.POOL.BROWSER);
 
-  async initialize() {
-    for (let i = 0; i < CONFIG.BROWSER_POOL_SIZE; i++) {
-      const browser = await puppeteer.launch(CONFIG.BROWSER_CONFIG);
-      const page = await browser.newPage();
-      await this.setupPage(page);
-      
-      this.browsers.push(browser);
-      this.pages.push(page);
-    }
-  }
-
-  async setupPage(page) {
+// Page pool
+const pagePool = genericPool.createPool({
+  create: async () => {
+    const browser = await browserPool.acquire();
+    const page = await browser.newPage();
     await page.setRequestInterception(true);
-    page.on('request', request => {
-      if (['media', 'font', 'image'].includes(request.resourceType())) {
-        request.abort();
-      } else {
-        request.continue();
-      }
+    
+    page.on('request', (req) => {
+      ['image', 'font', 'stylesheet', 'media'].includes(req.resourceType()) 
+        ? req.abort() 
+        : req.continue();
     });
+    
+    return { page, browser };
+  },
+  destroy: async ({ page, browser }) => {
+    await page.close();
+    await browserPool.release(browser);
   }
+}, CONFIG.POOL.PAGE);
 
-  getNextPage() {
-    const page = this.pages[this.currentIndex];
-    this.currentIndex = (this.currentIndex + 1) % this.pages.length;
-    return page;
-  }
+// Bull queue
+const imageQueue = new Queue('image-generation', process.env.REDIS_URL || 'redis://localhost:6379');
 
-  async cleanup() {
-    await Promise.all(this.browsers.map(browser => browser.close()));
-  }
-}
+// Express app
+const createApp = () => {
+  const app = express();
+  app.use(cors());
+  app.use(compression());
+  app.use(express.json({ limit: "10mb" }));
 
-const browserPool = new BrowserPool();
+  // Metrics endpoint
+  app.get('/metrics', async (req, res) => {
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
+  });
 
-// Fonction de génération d'image optimisée
-async function generateImage(html, options = {}) {
-  const hash = crypto.createHash("md5").update(html + JSON.stringify(options)).digest("hex");
+  // Image endpoints
+  app.post("/image", async (req, res) => {
+    const end = httpRequestDuration.startTimer();
+    try {
+      const job = await imageQueue.add({
+        html: req.body.html,
+        options: req.body
+      });
+      
+      res.json({ 
+        jobId: job.id,
+        statusUrl: `/job/${job.id}`
+      });
+    } catch (error) {
+      end({ method: 'POST', route: '/image', code: 500 });
+      res.status(500).json({ error: "Job creation failed" });
+    }
+    end({ method: 'POST', route: '/image', code: 200 });
+  });
+
+  app.get("/job/:id", async (req, res) => {
+    const job = await imageQueue.getJob(req.params.id);
+    
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    
+    const state = await job.getState();
+    const progress = job.progress();
+    
+    res.json({
+      id: job.id,
+      state,
+      progress,
+      result: state === 'completed' ? job.returnvalue : null
+    });
+  });
+
+  return app;
+};
+
+// Image generation worker
+imageQueue.process(os.cpus().length, async (job) => {
+  const { html, options } = job.data;
+  const hash = crypto.createHash("sha256").update(html + JSON.stringify(options)).digest("hex");
   
-  const cached = cache.get(hash);
-  if (cached) return cached;
+  if (cache.has(hash)) {
+    return cache.get(hash);
+  }
 
-  const page = browserPool.getNextPage();
-  
+  const { page } = await pagePool.acquire();
   try {
     const { width = 800, height = 600, quality = 80, format = 'jpeg' } = options;
-
-    await page.setViewport({ width, height, deviceScaleFactor: 1 });
+    
+    await page.setViewport({ width, height, deviceScaleFactor: 2 });
     await page.setContent(html, { 
-      waitUntil: ["load", "networkidle0"],
+      waitUntil: "networkidle0",
       timeout: CONFIG.PAGE_TIMEOUT 
     });
 
-    // Attente optimisée basée sur le contenu
-    await page.evaluate(() => {
-      return new Promise(resolve => {
-        if (document.readyState === 'complete') {
-          resolve();
-        } else {
-          window.addEventListener('load', resolve);
-        }
-      });
-    });
+    await page.waitForFunction(() => 
+      document.readyState === 'complete' && 
+      (window.renderingComplete === true || !window.renderingComplete),
+      { timeout: CONFIG.PAGE_TIMEOUT }
+    );
 
     let output;
-    if (format.toLowerCase() === 'pdf') {
+    if (format === 'pdf') {
       output = await page.pdf({
         width: `${width}px`,
         height: `${height}px`,
@@ -120,175 +170,51 @@ async function generateImage(html, options = {}) {
       });
     } else {
       output = await page.screenshot({
-        type: format.toLowerCase(),
-        quality: format.toLowerCase() === 'jpeg' ? quality : undefined,
-        fullPage: false
+        type: format,
+        quality: format === 'jpeg' ? quality : undefined,
+        fullPage: false,
+        omitBackground: false
       });
     }
 
     cache.set(hash, output);
     return output;
-  } catch (error) {
-    console.error('Generation error:', error);
-    throw error;
-  }
-}
-
-// Configuration du processeur de file d'attente
-imageQueue.process(async (job) => {
-  const { html, options } = job.data;
-  return await generateImage(html, options);
-});
-
-// Application Express
-const app = express();
-app.use(cors());
-app.use(compression());
-app.use(express.json({ limit: "50mb" }));
-
-// Routes optimisées
-app.post("/image", async (req, res) => {
-  try {
-    const { html, ...options } = req.body;
-    
-    if (!html) {
-      return res.status(400).json({ error: "HTML required" });
-    }
-
-    // Validation des options
-    const validatedOptions = validateOptions(options);
-    if (validatedOptions.error) {
-      return res.status(400).json({ error: validatedOptions.error });
-    }
-
-    // Ajout du job à la file d'attente
-    const job = await imageQueue.add({ html, options: validatedOptions });
-    
-    // Mode synchrone ou asynchrone selon le paramètre
-    if (req.query.async === 'true') {
-      return res.json({ jobId: job.id });
-    }
-
-    const result = await job.finished();
-    
-    res.set({
-      'Content-Type': options.format === 'pdf' ? 'application/pdf' : `image/${options.format}`,
-      'Cache-Control': 'public, max-age=3600'
-    });
-    res.end(result);
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: "Generation failed" });
+  } finally {
+    await pagePool.release({ page });
+    await page.evaluate(() => document.body.innerHTML = '');
   }
 });
 
-// Route pour vérifier le statut d'un job
-app.get("/status/:jobId", async (req, res) => {
-  try {
-    const job = await imageQueue.getJob(req.params.jobId);
-    if (!job) {
-      return res.status(404).json({ error: "Job not found" });
-    }
+// Cluster management
+if (cluster.isPrimary) {
+  // Pre-warm pools
+  browserPool.start();
+  pagePool.start();
 
-    const state = await job.getState();
-    const result = job.returnvalue;
-    
-    if (state === 'completed' && result) {
-      res.set({
-        'Content-Type': job.data.options.format === 'pdf' ? 'application/pdf' : `image/${job.data.options.format}`,
-        'Cache-Control': 'public, max-age=3600'
-      });
-      return res.end(result);
-    }
-
-    res.json({ state });
-  } catch (error) {
-    res.status(500).json({ error: "Status check failed" });
-  }
-});
-
-// Fonction de validation des options
-function validateOptions(options) {
-  const validated = {
-    width: parseInt(options.width) || 800,
-    height: parseInt(options.height) || 600,
-    quality: parseInt(options.quality) || 80,
-    format: (options.format || 'jpeg').toLowerCase()
-  };
-
-  if (validated.width < 1 || validated.width > 4000 || 
-      validated.height < 1 || validated.height > 4000) {
-    return { error: "Invalid dimensions" };
-  }
-
-  if (validated.quality < 1 || validated.quality > 100) {
-    return { error: "Invalid quality" };
-  }
-
-  if (!['jpeg', 'png', 'pdf'].includes(validated.format)) {
-    return { error: "Invalid format" };
-  }
-
-  return validated;
-}
-
-// Gestion du clustering
-if (cluster.isMaster) {
-  console.log(`Master ${process.pid} is running`);
-
-  // Fork workers
-  for (let i = 0; i < numCPUs; i++) {
+  for (let i = 0; i < os.cpus().length; i++) {
     cluster.fork();
   }
 
-  cluster.on('exit', (worker, code, signal) => {
+  cluster.on('exit', (worker) => {
     console.log(`Worker ${worker.process.pid} died`);
-    // Replace the dead worker
     cluster.fork();
   });
 } else {
-  // Workers can share any TCP connection
-  initialize();
-}
+  const app = createApp();
+  const server = app.listen(CONFIG.PORT, () => {
+    console.log(`Worker ${process.pid} listening on ${CONFIG.PORT}`);
+  });
 
-// Initialisation
-async function initialize() {
-  try {
-    await browserPool.initialize();
-    
-    app.listen(CONFIG.PORT, () => {
-      console.log(`Worker ${process.pid} started on port ${CONFIG.PORT}`);
-    });
-
-    // Surveillance mémoire
-    setInterval(() => {
-      const used = process.memoryUsage().heapUsed / 1024 / 1024;
-      if (used > 800) {
-        cache.clear();
-        console.log('Memory limit reached, cache cleared');
-      }
-    }, 30000);
-
-  } catch (error) {
-    console.error('Initialization failed:', error);
-    process.exit(1);
-  }
-}
-
-// Gestion de l'arrêt gracieux
-async function shutdown() {
-  console.log('Shutting down gracefully...');
-  try {
-    await browserPool.cleanup();
+  // Graceful shutdown
+  const shutdown = async () => {
+    console.log(`Worker ${process.pid} shutting down`);
+    await browserPool.drain();
+    await pagePool.drain();
     await imageQueue.close();
+    server.close();
     process.exit(0);
-  } catch (error) {
-    console.error('Error during shutdown:', error);
-    process.exit(1);
-  }
-}
+  };
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-process.on('uncaughtException', shutdown);
-process.on('unhandledRejection', shutdown);
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
