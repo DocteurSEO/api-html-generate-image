@@ -58,22 +58,19 @@ app.use(compression());
 app.use(express.json({ limit: "10mb" }));
 
 let browser;
-let page;
 
-// Initialisation optimisée de la page
+// Remove the global page variable and modify initializePage to always create a new page
 async function initializePage() {
-  if (!page) {
-    page = await browser.newPage();
-    await page.setRequestInterception(true);
-    
-    page.on('request', request => {
-      if (['image', 'font', 'media'].includes(request.resourceType())) {
-        request.abort();
-      } else {
-        request.continue();
-      }
-    });
-  }
+  const page = await browser.newPage();
+  await page.setRequestInterception(true);
+  
+  page.on('request', request => {
+    if (['image', 'font', 'media'].includes(request.resourceType())) {
+      request.abort();
+    } else {
+      request.continue();
+    }
+  });
   return page;
 }
 
@@ -91,9 +88,10 @@ async function generateImage(html, options = {}) {
 
 // Queue process handler
 imageQueue.process(async (job) => {
+  let page;
   const { html, options } = job.data;
   try {
-    const page = await initializePage();
+    page = await initializePage();
     const { width = 800, height = 600, quality = 80, format = 'jpeg' } = options;
 
     await page.setViewport({ width, height, deviceScaleFactor: 1 });
@@ -129,9 +127,9 @@ imageQueue.process(async (job) => {
   } finally {
     if (page) {
       try {
-        await page.close();
+        await page.close().catch(e => console.error('Error closing page:', e));
       } catch (e) {
-        console.error('Error closing page:', e);
+        console.error('Error in finally block while closing page:', e);
       }
     }
   }
