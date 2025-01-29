@@ -21,8 +21,12 @@ const CONFIG = {
       '--disable-gpu',
       '--disable-extensions',
       '--js-flags=--max-old-space-size=512',
-      '--single-process'
-    ]
+      '--single-process',
+      '--font-render-hinting=medium',
+      '--enable-font-antialiasing',
+      '--force-color-profile=srgb'
+    ],
+    ignoreDefaultArgs: ['--disable-font-subpixel-positioning']
   }
 };
 
@@ -48,7 +52,7 @@ async function initializePage() {
     await page.setRequestInterception(true);
     
     page.on('request', request => {
-      if (['media'].includes(request.resourceType())) {
+      if (['media', 'image'].includes(request.resourceType()) && !request.url().includes('fonts')) {
         request.abort();
       } else {
         request.continue();
