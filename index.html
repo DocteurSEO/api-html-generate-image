@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTML to Image Generator</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        textarea {
+            width: 100%;
+            height: 200px;
+            margin: 10px 0;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            resize: vertical;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        #result {
+            margin-top: 20px;
+            text-align: center;
+        }
+        #processingTime {
+            color: #666;
+            margin-top: 10px;
+        }
+        .loading {
+            display: none;
+            margin: 20px 0;
+            text-align: center;
+            color: #666;
+        }
+        .error {
+            color: #ff0000;
+            margin-top: 10px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HTML to Image Generator</h1>
+        <form id="htmlForm">
+            <div>
+                <label for="htmlContent">Enter HTML Content:</label>
+                <textarea id="htmlContent" name="htmlContent" required></textarea>
+            </div>
+            <button type="submit">Generate Image</button>
+        </form>
+        
+        <div class="loading" id="loading">Generating image...</div>
+        <div class="error" id="error"></div>
+        
+        <div id="result">
+            <img id="generatedImage" style="max-width: 100%; display: none;">
+            <div id="processingTime"></div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('htmlForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const htmlContent = document.getElementById('htmlContent').value;
+            const loading = document.getElementById('loading');
+            const error = document.getElementById('error');
+            const result = document.getElementById('result');
+            const generatedImage = document.getElementById('generatedImage');
+            const processingTime = document.getElementById('processingTime');
+            
+            // Reset display
+            error.style.display = 'none';
+            generatedImage.style.display = 'none';
+            processingTime.textContent = '';
+            loading.style.display = 'block';
+            
+            const startTime = performance.now();
+            
+            try {
+                const response = await fetch('http://localhost:3001/image', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        html: htmlContent
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to generate image');
+                }
+                
+                const blob = await response.blob();
+                const imageUrl = URL.createObjectURL(blob);
+                
+                const endTime = performance.now();
+                const duration = Math.round(endTime - startTime);
+                
+                generatedImage.src = imageUrl;
+                generatedImage.style.display = 'block';
+                processingTime.textContent = `Processing Time: ${duration}ms`;
+            } catch (err) {
+                error.textContent = 'Error: ' + err.message;
+                error.style.display = 'block';
+            } finally {
+                loading.style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>
