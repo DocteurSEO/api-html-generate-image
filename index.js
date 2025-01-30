@@ -177,6 +177,15 @@ class ImageGenerator {
 
         const result = await this.generateOutput(page, options);
         this.cache.set(hash, result);
+
+        if (options.format === 'pdf') {
+          res.setHeader('Content-Type', 'application/pdf');
+        } else {
+          res.setHeader('Content-Type', `image/${options.format}`);
+        }
+
+
+
         res.end(result);
       } catch (error) {
         console.error('Generation error:', error);
@@ -265,6 +274,8 @@ class ImageGenerator {
     } else {
       return await page.screenshot({
         type: options.format,
+        width: options.width,
+        height: options.height,
         quality: options.quality,
         fullPage: options.fullPage,
         optimizeForSpeed: true
