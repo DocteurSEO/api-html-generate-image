@@ -177,7 +177,7 @@ class ImageGenerator {
 
         const result = await this.generateOutput(page, options);
         this.cache.set(hash, result);
-
+          
         if (options.format === 'pdf') {
           res.setHeader('Content-Type', 'application/pdf');
         } else {
