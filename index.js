@@ -246,7 +246,10 @@ class ImageGenerator {
       format: (params.format || 'jpeg').toLowerCase(),
       fullPage: params.fullPage === 'true'
     };
-
+  if(params.format =='png'.toLocaleLowerCase()){
+    //remove quality
+    delete options['quality']
+  }
     if (options.width < 1 || options.width > 4000 || 
         options.height < 1 || options.height > 4000) {
       return { error: "Invalid dimensions" };
