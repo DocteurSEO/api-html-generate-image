@@ -128,7 +128,13 @@ class ImageGenerator {
   }
 
   setupMiddleware() {
-    this.app.use(cors());
+    this.app.use(cors({
+      origin: '*',
+      methods: ['GET', 'POST', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'CF-Connecting-IP', 'CF-IPCountry', 'CF-RAY', 'X-Forwarded-For'],
+      credentials: true,
+      maxAge: 86400
+    }));
     this.app.use(compression({
       level: 6,
       threshold: 10 * 1024

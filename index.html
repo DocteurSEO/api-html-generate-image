@@ -3,29 +3,64 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HTML to Image Generator</title>
+    <title>Template Generator</title>
     <style>
         body {
             font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 0 auto;
+            margin: 0;
             padding: 20px;
             background-color: #f5f5f5;
         }
         .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .panel {
             background-color: white;
             padding: 20px;
             border-radius: 8px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-        textarea {
+        .editor-panel {
+            display: flex;
+            flex-direction: column;
+        }
+        #templateEditor {
             width: 100%;
-            height: 200px;
+            height: 300px;
             margin: 10px 0;
             padding: 10px;
             border: 1px solid #ddd;
             border-radius: 4px;
             resize: vertical;
+            font-family: monospace;
+        }
+        .preview-panel {
+            display: flex;
+            flex-direction: column;
+        }
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 10px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #666;
+        }
+        input, select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
         }
         button {
             background-color: #4CAF50;
@@ -34,23 +69,54 @@
             border: none;
             border-radius: 4px;
             cursor: pointer;
+            margin: 5px;
         }
         button:hover {
             background-color: #45a049;
         }
-        #result {
-            margin-top: 20px;
-            text-align: center;
-        }
-        #processingTime {
-            color: #666;
+        .button-group {
+            display: flex;
+            gap: 10px;
             margin-top: 10px;
+        }
+        #previewFrame {
+            width: 100%;
+            height: 400px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .history-panel {
+            margin-top: 20px;
+            padding: 20px;
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .history-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .history-card {
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .history-card:hover {
+            background-color: #f5f5f5;
+        }
+        #templateId {
+            font-family: monospace;
+            margin-top: 10px;
+            color: #666;
         }
         .loading {
             display: none;
-            margin: 20px 0;
             text-align: center;
             color: #666;
+            margin: 10px 0;
         }
         .error {
             color: #ff0000;
@@ -61,74 +127,196 @@
 </head>
 <body>
     <div class="container">
-        <h1>HTML to Image Generator</h1>
-        <form id="htmlForm">
-            <div>
-                <label for="htmlContent">Enter HTML Content:</label>
-                <textarea id="htmlContent" name="htmlContent" required></textarea>
+        <div class="panel editor-panel">
+            <h2>Template Editor</h2>
+            <textarea id="templateEditor" placeholder="Enter your HTML template with parameters like {{name}}"></textarea>
+            <div class="button-group">
+                <button id="saveTemplate">Save Template</button>
+                <button id="clearEditor">Clear</button>
             </div>
-            <button type="submit">Generate Image</button>
-        </form>
-        
-        <div class="loading" id="loading">Generating image...</div>
-        <div class="error" id="error"></div>
-        
-        <div id="result">
-            <img id="generatedImage" style="max-width: 100%; display: none;">
-            <div id="processingTime"></div>
+            <div id="templateId"></div>
+        </div>
+
+        <div class="panel preview-panel">
+            <h2>Preview & Generate</h2>
+            <div id="parameterControls" class="controls"></div>
+            <div class="form-group">
+                <label for="formatSelect">Output Format:</label>
+                <select id="formatSelect">
+                    <option value="jpeg">JPEG</option>
+                    <option value="png">PNG</option>
+                    <option value="pdf">PDF</option>
+                </select>
+            </div>
+            <button id="generateBtn">Generate Output</button>
+            <div id="previewContainer">
+                <img id="previewImage" style="max-width: 100%; display: none;">
+                <iframe id="previewFrame" style="display: none;"></iframe>
+            </div>
+            <div class="loading" id="loading">Processing...</div>
+            <div class="error" id="error"></div>
         </div>
     </div>
 
+    <div class="history-panel">
+        <h2>Template History</h2>
+        <div id="historyCards" class="history-cards"></div>
+    </div>
+
     <script>
-        document.getElementById('htmlForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
+        let currentTemplateId = null;
+        const API_BASE = 'https://api-html-template.docteurseoo.workers.dev';
+
+        // Load history from localStorage
+        function loadHistory() {
+            const history = JSON.parse(localStorage.getItem('templateHistory') || '[]');
+            const historyCards = document.getElementById('historyCards');
+            historyCards.innerHTML = '';
             
-            const htmlContent = document.getElementById('htmlContent').value;
-            const loading = document.getElementById('loading');
-            const error = document.getElementById('error');
-            const result = document.getElementById('result');
-            const generatedImage = document.getElementById('generatedImage');
-            const processingTime = document.getElementById('processingTime');
-            
-            // Reset display
-            error.style.display = 'none';
-            generatedImage.style.display = 'none';
-            processingTime.textContent = '';
-            loading.style.display = 'block';
-            
-            const startTime = performance.now();
-            
+            history.forEach(item => {
+                const card = document.createElement('div');
+                card.className = 'history-card';
+                card.textContent = `Template ${item.id}`;
+                card.onclick = () => loadTemplate(item.id);
+                historyCards.appendChild(card);
+            });
+        }
+
+        // Save template to history
+        function saveToHistory(id) {
+            const history = JSON.parse(localStorage.getItem('templateHistory') || '[]');
+            if (!history.find(item => item.id === id)) {
+                history.unshift({ id, timestamp: Date.now() });
+                localStorage.setItem('templateHistory', JSON.stringify(history));
+                loadHistory();
+            }
+        }
+
+        // Load template parameters
+        async function loadTemplate(id) {
             try {
-                const response = await fetch('http://localhost:3001/image', {
+                const response = await fetch(`${API_BASE}/template/${id}`);
+                const data = await response.json();
+                
+                document.getElementById('parameterControls').innerHTML = '';
+                Object.keys(data).forEach(key => {
+                    if (key !== 'id') {
+                        createParameterInput(key, data[key]);
+                    }
+                });
+                
+                currentTemplateId = id;
+                document.getElementById('templateId').textContent = `Template ID: ${id}`;
+            } catch (error) {
+                showError('Failed to load template parameters');
+            }
+        }
+
+        // Create parameter input field
+        function createParameterInput(name, value) {
+            const container = document.createElement('div');
+            container.className = 'form-group';
+            
+            const label = document.createElement('label');
+            label.textContent = name;
+            label.htmlFor = `param-${name}`;
+            
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.id = `param-${name}`;
+            input.value = value;
+            
+            container.appendChild(label);
+            container.appendChild(input);
+            document.getElementById('parameterControls').appendChild(container);
+        }
+
+        // Save template
+        document.getElementById('saveTemplate').onclick = async () => {
+            const template = document.getElementById('templateEditor').value;
+            if (!template) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/template`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        html: htmlContent
+                        template,
+                        userId: 'beta'
                     })
                 });
                 
-                if (!response.ok) {
-                    throw new Error('Failed to generate image');
-                }
+                const data = await response.json();
+                currentTemplateId = data.id;
+                document.getElementById('templateId').textContent = `Template ID: ${data.id}`;
+                saveToHistory(data.id);
+                await loadTemplate(data.id);
+            } catch (error) {
+                showError('Failed to save template');
+            }
+        };
+
+        // Generate output
+        document.getElementById('generateBtn').onclick = async () => {
+            if (!currentTemplateId) {
+                showError('Please save the template first');
+                return;
+            }
+
+            const format = document.getElementById('formatSelect').value;
+            const params = {};
+            document.querySelectorAll('#parameterControls input').forEach(input => {
+                params[input.id.replace('param-', '')] = input.value;
+            });
+
+            const loading = document.getElementById('loading');
+            const error = document.getElementById('error');
+            const previewImage = document.getElementById('previewImage');
+            const previewFrame = document.getElementById('previewFrame');
+
+            loading.style.display = 'block';
+            error.style.display = 'none';
+            previewImage.style.display = 'none';
+            previewFrame.style.display = 'none';
+
+            try {
+                const queryString = new URLSearchParams(params).toString();
+                const response = await fetch(`${API_BASE}/template/${currentTemplateId}?${queryString}`);
+                
+                if (!response.ok) throw new Error('Generation failed');
                 
                 const blob = await response.blob();
-                const imageUrl = URL.createObjectURL(blob);
-                
-                const endTime = performance.now();
-                const duration = Math.round(endTime - startTime);
-                
-                generatedImage.src = imageUrl;
-                generatedImage.style.display = 'block';
-                processingTime.textContent = `Processing Time: ${duration}ms`;
-            } catch (err) {
-                error.textContent = 'Error: ' + err.message;
-                error.style.display = 'block';
+                const url = URL.createObjectURL(blob);
+
+                if (format === 'pdf') {
+                    previewFrame.src = url;
+                    previewFrame.style.display = 'block';
+                } else {
+                    previewImage.src = url;
+                    previewImage.style.display = 'block';
+                }
+            } catch (error) {
+                showError(error.message);
             } finally {
                 loading.style.display = 'none';
             }
-        });
+        };
+
+        // Clear editor
+        document.getElementById('clearEditor').onclick = () => {
+            document.getElementById('templateEditor').value = '';
+            document.getElementById('templateId').textContent = '';
+            currentTemplateId = null;
+        };
+
+        function showError(message) {
+            const error = document.getElementById('error');
+            error.textContent = message;
+            error.style.display = 'block';
+        }
+
+        // Initial load
+        loadHistory();
     </script>
 </body>
 </html>
